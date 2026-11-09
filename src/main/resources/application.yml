@@ -1,0 +1,62 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: viral-simulation-backend
+
+  threads:
+    virtual:
+      enabled: true
+
+  # Si SPRING_DATASOURCE_URL no está definida en el entorno, usa H2 en memoria compatible con PostgreSQL
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:h2:mem:viral_db;DB_CLOSE_DELAY=-1;MODE=PostgreSQL}
+    username: ${SPRING_DATASOURCE_USERNAME:sa}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+    driver-class-name: ${SPRING_DATASOURCE_DRIVER:org.h2.Driver}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 20000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  data:
+    redis:
+      host: ${SPRING_REDIS_HOST:localhost}
+      port: ${SPRING_REDIS_PORT:6379}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 50
+          max-idle: 10
+          min-idle: 2
+
+app:
+  simulation:
+    heartbeat-window-ms: 120000 # 2 minutos para el límite k
+    density-window-ms: 60000     # 1 minuto para el cálculo de r
+    scheduler-rate-ms: 5000      # 5 segundos entre cada Board Update
+    base-growth-rate: 0.04
+    max-growth-rate: 0.50
+    density-coefficient: 0.08
+  firebase:
+    service-account-path: ${FIREBASE_CREDENTIALS_PATH:firebase-service-account.json}
+
+logging:
+  level:
+    root: INFO
+    com.campus.viral: INFO

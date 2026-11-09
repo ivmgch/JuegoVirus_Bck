@@ -1,0 +1,138 @@
+package com.campus.viral.scheduler;
+
+import com.campus.viral.model.domain.PlayerStatus;
+import com.campus.viral.model.domain.SessionStatus;
+import com.campus.viral.model.dto.response.BoardUpdateMessage;
+import com.campus.viral.model.entity.GameSession;
+import com.campus.viral.repository.jpa.GameSessionRepository;
+import com.campus.viral.repository.jpa.PlayerNodeRepository;
+import com.campus.viral.repository.redis.ActivePlayerRedisRepository;
+import com.campus.viral.service.FcmNotificationService;
+import com.campus.viral.service.MathService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+
+@Component
+public class GameSimulationScheduler {
+
+    private static final Logger log = LoggerFactory.getLogger(GameSimulationScheduler.class);
+
+    private final GameSessionRepository sessionRepository;
+    private final PlayerNodeRepository playerRepository;
+    private final ActivePlayerRedisRepository redisRepository;
+    private final MathService mathService;
+    private final FcmNotificationService fcmNotificationService;
+    private final SimpMessagingTemplate messagingTemplate;
+
+    public GameSimulationScheduler(
+        GameSessionRepository sessionRepository,
+        PlayerNodeRepository playerRepository,
+        ActivePlayerRedisRepository redisRepository,
+        MathService mathService,
+        FcmNotificationService fcmNotificationService,
+        SimpMessagingTemplate messagingTemplate
+    ) {
+        this.sessionRepository = sessionRepository;
+        this.playerRepository = playerRepository;
+        this.redisRepository = redisRepository;
+        this.mathService = mathService;
+        this.fcmNotificationService = fcmNotificationService;
+        this.messagingTemplate = messagingTemplate;
+    }
+
+    /**
+     * Ciclo de simulación cada 5 segundos:
+     * - Recalcula las variables matemáticas del modelo logístico (k, A, r, P(t)).
+     * - Emite BOARD_UPDATE por WebSocket a todos los clientes.
+     * - Evalúa el punto de inflexión poblacional (k / 2) para disparar la alerta FCM.
+     */
+    @Scheduled(fixedRateString = "${app.simulation.scheduler-rate-ms:5000}")
+    @Transactional
+    public void executeSimulationCycle() {
+        List<GameSession> activeSessions = sessionRepository.findByStatus(SessionStatus.ACTIVE);
+        if (activeSessions.isEmpty()) {
+            return;
+        }
+
+        Instant now = Instant.now();
+
+        for (GameSession session : activeSessions) {
+            Long sessionId = session.getId();
+            if (sessionId == null) continue;
+
+            Instant startedAt = session.getStartedAt() != null ? session.getStartedAt() : now;
+            double tElapsedSeconds = (double) Duration.between(startedAt, now).getSeconds();
+
+            // 1. Obtener 'k' dinámico desde Redis (Heartbeats activos en los últimos 2 minutos)
+            double currentK = redisRepository.getActiveCarryingCapacityK(sessionId);
+
+            // Si aún no hay heartbeats reportados en Redis, mantener al menos el k previo
+            if (currentK <= 0.0) {
+                currentK = Math.max(session.getCarryingCapacityK(), session.getInitialInfectedP0());
+            }
+
+            // 2. Conteo real de infectados y sanos en base de datos
+            long realInfectedCount = playerRepository.countBySessionIdAndStatusIn(
+                sessionId, List.of(PlayerStatus.PATIENT_ZERO, PlayerStatus.INFECTED)
+            );
+            long realHealthyCount = playerRepository.countBySessionIdAndStatusIn(
+                sessionId, List.of(PlayerStatus.HEALTHY)
+            );
+
+            // 3. Obtener densidad BLE acumulada en Redis para computar 'r' dinámico
+            long bleInteractions = redisRepository.getRecentBleInteractionsCount(sessionId);
+            double dynamicR = mathService.calculateDynamicR(currentK, bleInteractions);
+
+            // 4. Suavizar la constante 'A' para mantener la continuidad en la gráfica de Vico
+            double currentA = mathService.recalculateSmoothedA(
+                currentK,
+                (double) realInfectedCount,
+                dynamicR,
+                tElapsedSeconds
+            );
+
+            // 5. Resolver P(t) teórico
+            double theoreticalPt = mathService.solveLogistic(currentK, currentA, dynamicR, tElapsedSeconds);
+
+            // 6. Actualizar las constantes de la sesión en PostgreSQL
+            session.setCarryingCapacityK(currentK);
+            session.setIntegrationConstantA(currentA);
+            session.setGrowthRateR(dynamicR);
+            sessionRepository.save(session);
+
+            // 7. Emitir BROADCAST cada 5 segundos al tópico de la sesión (/topic/board/{sessionId})
+            BoardUpdateMessage boardUpdate = new BoardUpdateMessage(
+                sessionId,
+                currentK,
+                currentA,
+                dynamicR,
+                realInfectedCount,
+                realHealthyCount,
+                theoreticalPt,
+                now.toEpochMilli()
+            );
+
+            messagingTemplate.convertAndSend("/topic/board/" + sessionId, boardUpdate);
+
+            // 8. Evaluar Alerta Crítica (Población infectada >= k / 2)
+            if (!session.isInflectionAlertSent() && mathService.isInflectionPointReached((double) realInfectedCount, currentK)) {
+                log.warn("¡ALERTA CRÍTICA! Sesión {} alcanzó el punto de inflexión k/2 (Infectados={}, k={})",
+                    sessionId, realInfectedCount, currentK);
+
+                List<String> healthyTokens = playerRepository.findHealthyFcmTokensBySessionId(sessionId);
+                fcmNotificationService.sendCriticalInflectionAlert(healthyTokens, currentK, realInfectedCount);
+
+                session.setInflectionAlertSent(true);
+                sessionRepository.save(session);
+            }
+        }
+    }
+}
