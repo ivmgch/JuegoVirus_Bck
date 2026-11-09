@@ -9,15 +9,16 @@ spring:
     virtual:
       enabled: true
 
-  # Si SPRING_DATASOURCE_URL no está definida en el entorno, usa H2 en memoria compatible con PostgreSQL
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:h2:mem:viral_db;DB_CLOSE_DELAY=-1;MODE=PostgreSQL}
-    username: ${SPRING_DATASOURCE_USERNAME:sa}
-    password: ${SPRING_DATASOURCE_PASSWORD:}
-    driver-class-name: ${SPRING_DATASOURCE_DRIVER:org.h2.Driver}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://aws-0-us-east-2.pooler.supabase.com:5432/postgres?sslmode=require}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres.clhjzfxvenbatgwcfjof}
+    password: ${SPRING_DATASOURCE_PASSWORD:2YOdxL2mRWmPLXvp}
+    driver-class-name: org.postgresql.Driver
     hikari:
-      maximum-pool-size: 20
-      minimum-idle: 5
+      maximum-pool-size: 10
+      minimum-idle: 2
+      idle-timeout: 300000
+      max-lifetime: 600000
       connection-timeout: 20000
 
   jpa:
@@ -28,11 +29,6 @@ spring:
     properties:
       hibernate:
         format_sql: true
-
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
 
   data:
     redis:
@@ -60,3 +56,4 @@ logging:
   level:
     root: INFO
     com.campus.viral: INFO
+    org.hibernate.SQL: WARN
