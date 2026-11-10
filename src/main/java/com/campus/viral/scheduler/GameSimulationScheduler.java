@@ -50,20 +50,42 @@ public class GameSimulationScheduler {
 
     /**
      * Ciclo de simulación cada 5 segundos:
-     * - Recalcula las variables matemáticas del modelo logístico (k, A, r, P(t)).
+     * - Para partidas en espera (LOBBY): Sincroniza el conteo de jugadores conectados.
+     * - Para partidas activas: Recalcula las variables del modelo logístico (k, A, r, P(t)).
      * - Emite BOARD_UPDATE por WebSocket a todos los clientes.
      * - Evalúa el punto de inflexión poblacional (k / 2) para disparar la alerta FCM.
      */
     @Scheduled(fixedRateString = "${app.simulation.scheduler-rate-ms:5000}")
     @Transactional
     public void executeSimulationCycle() {
-        List<GameSession> activeSessions = sessionRepository.findByStatus(SessionStatus.ACTIVE);
-        if (activeSessions.isEmpty()) {
-            return;
-        }
-
         Instant now = Instant.now();
 
+        // 1. Sincronizar sesiones en sala de espera (LOBBY)
+        List<GameSession> waitingSessions = sessionRepository.findByStatus(SessionStatus.WAITING_FOR_PLAYERS);
+        for (GameSession session : waitingSessions) {
+            Long sessionId = session.getId();
+            if (sessionId == null) continue;
+
+            long totalPlayers = playerRepository.countBySessionId(sessionId);
+            BoardUpdateMessage lobbyUpdate = new BoardUpdateMessage(
+                sessionId,
+                (double) totalPlayers,
+                session.getIntegrationConstantA(),
+                session.getGrowthRateR(),
+                0,
+                totalPlayers,
+                0.0,
+                now.toEpochMilli(),
+                SessionStatus.WAITING_FOR_PLAYERS.name(),
+                totalPlayers,
+                3,
+                totalPlayers >= 3
+            );
+            messagingTemplate.convertAndSend("/topic/board/" + sessionId, lobbyUpdate);
+        }
+
+        // 2. Ejecutar modelo logístico continuo para partidas activas
+        List<GameSession> activeSessions = sessionRepository.findByStatus(SessionStatus.ACTIVE);
         for (GameSession session : activeSessions) {
             Long sessionId = session.getId();
             if (sessionId == null) continue;
@@ -74,7 +96,6 @@ public class GameSimulationScheduler {
             // 1. Obtener 'k' dinámico desde Redis (Heartbeats activos en los últimos 2 minutos)
             double currentK = redisRepository.getActiveCarryingCapacityK(sessionId);
 
-            // Si aún no hay heartbeats reportados en Redis, mantener al menos el k previo
             if (currentK <= 0.0) {
                 currentK = Math.max(session.getCarryingCapacityK(), session.getInitialInfectedP0());
             }
@@ -86,6 +107,7 @@ public class GameSimulationScheduler {
             long realHealthyCount = playerRepository.countBySessionIdAndStatusIn(
                 sessionId, List.of(PlayerStatus.HEALTHY)
             );
+            long totalPlayers = realInfectedCount + realHealthyCount;
 
             // 3. Obtener densidad BLE acumulada en Redis para computar 'r' dinámico
             long bleInteractions = redisRepository.getRecentBleInteractionsCount(sessionId);
@@ -117,7 +139,11 @@ public class GameSimulationScheduler {
                 realInfectedCount,
                 realHealthyCount,
                 theoreticalPt,
-                now.toEpochMilli()
+                now.toEpochMilli(),
+                SessionStatus.ACTIVE.name(),
+                totalPlayers,
+                3,
+                true
             );
 
             messagingTemplate.convertAndSend("/topic/board/" + sessionId, boardUpdate);

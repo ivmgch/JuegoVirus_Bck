@@ -1,12 +1,15 @@
 package com.campus.viral.controller.rest;
 
+import com.campus.viral.exception.BusinessRuleException;
 import com.campus.viral.exception.ResourceNotFoundException;
 import com.campus.viral.model.domain.PlayerStatus;
 import com.campus.viral.model.domain.SessionStatus;
 import com.campus.viral.model.dto.request.CreateSessionRequest;
 import com.campus.viral.model.dto.request.JoinSessionRequest;
+import com.campus.viral.model.dto.response.BoardUpdateMessage;
 import com.campus.viral.model.dto.response.JoinResponse;
 import com.campus.viral.model.dto.response.SessionResponse;
+import com.campus.viral.model.dto.response.StateChangeMessage;
 import com.campus.viral.model.entity.GameSession;
 import com.campus.viral.model.entity.PlayerNode;
 import com.campus.viral.repository.jpa.GameSessionRepository;
@@ -16,6 +19,7 @@ import com.campus.viral.service.MathService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
@@ -29,23 +33,28 @@ import java.util.UUID;
 @RequestMapping("/api/v1/sessions")
 public class SessionController {
 
+    public static final int MIN_PLAYERS_REQUIRED = 3;
+
     private final GameSessionRepository sessionRepository;
     private final PlayerNodeRepository playerRepository;
     private final ActivePlayerRedisRepository redisRepository;
     private final MathService mathService;
+    private final SimpMessagingTemplate messagingTemplate;
 
     public SessionController(GameSessionRepository sessionRepository,
                              PlayerNodeRepository playerRepository,
                              ActivePlayerRedisRepository redisRepository,
-                             MathService mathService) {
+                             MathService mathService,
+                             SimpMessagingTemplate messagingTemplate) {
         this.sessionRepository = sessionRepository;
         this.playerRepository = playerRepository;
         this.redisRepository = redisRepository;
         this.mathService = mathService;
+        this.messagingTemplate = messagingTemplate;
     }
 
     /**
-     * RF01: Crea una nueva partida y define la condición inicial P(0).
+     * RF01: Crea una nueva partida en estado WAITING_FOR_PLAYERS.
      */
     @PostMapping
     @Transactional
@@ -53,6 +62,10 @@ public class SessionController {
         Optional<GameSession> existing = sessionRepository.findBySessionCode(request.sessionCode());
         if (existing.isPresent()) {
             GameSession s = existing.get();
+            List<PlayerNode> currentPlayers = playerRepository.findBySessionId(s.getId());
+            long total = currentPlayers.size();
+            List<String> uuids = currentPlayers.stream().map(PlayerNode::getPlayerUuid).toList();
+
             return ResponseEntity.ok(
                 new SessionResponse(
                     s.getId(),
@@ -60,21 +73,23 @@ public class SessionController {
                     s.getStatus(),
                     s.getInitialInfectedP0(),
                     s.getCarryingCapacityK(),
-                    s.getIntegrationConstantA()
+                    s.getIntegrationConstantA(),
+                    total,
+                    MIN_PLAYERS_REQUIRED,
+                    total >= MIN_PLAYERS_REQUIRED,
+                    uuids
                 )
             );
         }
 
-        double initialK = request.initialP0() * 2.0; // Base inicial para k
-        double initialA = mathService.calculateInitialA(initialK, request.initialP0());
-
+        // Se inicia en sala de espera hasta que se conecten al menos 3 jugadores
         GameSession session = new GameSession(
             request.sessionCode(),
-            SessionStatus.ACTIVE,
-            request.initialP0(),
-            initialK,
-            initialA,
-            Instant.now()
+            SessionStatus.WAITING_FOR_PLAYERS,
+            Math.max(1, request.initialP0()),
+            0.0,
+            1.0,
+            null
         );
 
         GameSession saved = sessionRepository.save(session);
@@ -86,13 +101,17 @@ public class SessionController {
                 saved.getStatus(),
                 saved.getInitialInfectedP0(),
                 saved.getCarryingCapacityK(),
-                saved.getIntegrationConstantA()
+                saved.getIntegrationConstantA(),
+                0,
+                MIN_PLAYERS_REQUIRED,
+                false,
+                List.of()
             )
         );
     }
 
     /**
-     * RF01 / RN01: Registra un dispositivo móvil en la sesión y lo suma a 'k' en Redis.
+     * RF01 / RN01: Registra un dispositivo móvil en la sesión (Lobby o Partida activa).
      */
     @PostMapping("/{id}/join")
     @Transactional
@@ -105,51 +124,161 @@ public class SessionController {
 
         // Verificar si el dispositivo ya estaba registrado en esta sesión
         Optional<PlayerNode> existingPlayer = playerRepository.findBySessionIdAndDeviceMacHash(id, request.deviceMacHash());
+        PlayerNode player;
         if (existingPlayer.isPresent()) {
-            PlayerNode player = existingPlayer.get();
+            player = existingPlayer.get();
             if (request.fcmToken() != null && !request.fcmToken().isBlank()) {
                 player.setFcmToken(request.fcmToken());
                 playerRepository.save(player);
             }
-            redisRepository.recordHeartbeat(id, player.getPlayerUuid(), 0);
-            return ResponseEntity.ok(new JoinResponse(
+        } else {
+            // Si la partida ya está activa, aplicar rol de acuerdo a p0, sino entra como HEALTHY a la sala de espera
+            PlayerStatus initialStatus = PlayerStatus.HEALTHY;
+            if (session.getStatus() == SessionStatus.ACTIVE) {
+                long currentInfected = playerRepository.countBySessionIdAndStatusIn(
+                    id, List.of(PlayerStatus.PATIENT_ZERO, PlayerStatus.INFECTED)
+                );
+                if (currentInfected < session.getInitialInfectedP0()) {
+                    initialStatus = PlayerStatus.PATIENT_ZERO;
+                }
+            }
+
+            String playerUuid = UUID.randomUUID().toString();
+            player = new PlayerNode(
+                session,
+                request.deviceMacHash(),
+                playerUuid,
+                initialStatus,
+                request.fcmToken(),
+                initialStatus == PlayerStatus.PATIENT_ZERO ? Instant.now() : null
+            );
+            playerRepository.save(player);
+        }
+
+        // Registrar inmediatamente en Redis
+        redisRepository.recordHeartbeat(id, player.getPlayerUuid(), 0);
+
+        // Notificar en tiempo real a todos los clientes suscritos al tablero sobre el nuevo jugador en la sala
+        List<PlayerNode> allPlayers = playerRepository.findBySessionId(id);
+        long totalCount = allPlayers.size();
+        long infectedCount = allPlayers.stream().filter(p -> p.getStatus() == PlayerStatus.PATIENT_ZERO || p.getStatus() == PlayerStatus.INFECTED).count();
+        long healthyCount = totalCount - infectedCount;
+
+        BoardUpdateMessage lobbyUpdate = new BoardUpdateMessage(
+            id,
+            session.getStatus() == SessionStatus.ACTIVE ? session.getCarryingCapacityK() : totalCount,
+            session.getIntegrationConstantA(),
+            session.getGrowthRateR(),
+            infectedCount,
+            healthyCount,
+            (double) infectedCount,
+            System.currentTimeMillis(),
+            session.getStatus().name(),
+            totalCount,
+            MIN_PLAYERS_REQUIRED,
+            totalCount >= MIN_PLAYERS_REQUIRED
+        );
+        messagingTemplate.convertAndSend("/topic/board/" + id, lobbyUpdate);
+
+        return ResponseEntity.ok(
+            new JoinResponse(
                 player.getPlayerUuid(),
                 id,
                 player.getStatus(),
                 player.getCreatedAt()
-            ));
+            )
+        );
+    }
+
+    /**
+     * Inicia formalmente la partida de simulación cuando hay al menos 3 jugadores.
+     */
+    @PostMapping("/{id}/start")
+    @Transactional
+    public ResponseEntity<SessionResponse> startSession(@PathVariable("id") Long id) {
+        GameSession session = sessionRepository.findById(id)
+            .orElseThrow(() -> new ResourceNotFoundException("Sesión no encontrada con ID: " + id));
+
+        List<PlayerNode> players = playerRepository.findBySessionId(id);
+        long totalPlayers = players.size();
+
+        if (totalPlayers < MIN_PLAYERS_REQUIRED) {
+            throw new BusinessRuleException(
+                "No se puede iniciar la partida: se requieren al menos " + MIN_PLAYERS_REQUIRED +
+                " jugadores conectados. Actualmente hay " + totalPlayers + "."
+            );
         }
 
-        // Asignación de rol: Paciente Cero si aún no se ha alcanzado P(0)
-        long currentInfected = playerRepository.countBySessionIdAndStatusIn(
-            id, List.of(PlayerStatus.PATIENT_ZERO, PlayerStatus.INFECTED)
-        );
+        if (session.getStatus() != SessionStatus.ACTIVE) {
+            session.setStatus(SessionStatus.ACTIVE);
+            session.setStartedAt(Instant.now());
 
-        PlayerStatus assignedStatus = (currentInfected < session.getInitialInfectedP0())
-            ? PlayerStatus.PATIENT_ZERO
-            : PlayerStatus.HEALTHY;
+            // Asignar Paciente Cero entre los jugadores conectados
+            // Al menos 1 paciente cero y como máximo (totalPlayers - 1) para que haya sanos susceptibles
+            int p0Count = Math.max(1, Math.min(session.getInitialInfectedP0(), (int) totalPlayers - 1));
 
-        String playerUuid = UUID.randomUUID().toString();
-        PlayerNode player = new PlayerNode(
-            session,
-            request.deviceMacHash(),
-            playerUuid,
-            assignedStatus,
-            request.fcmToken(),
-            assignedStatus == PlayerStatus.PATIENT_ZERO ? Instant.now() : null
-        );
+            for (int i = 0; i < players.size(); i++) {
+                PlayerNode p = players.get(i);
+                if (i < p0Count) {
+                    p.setStatus(PlayerStatus.PATIENT_ZERO);
+                    p.setInfectedAt(Instant.now());
+                } else {
+                    p.setStatus(PlayerStatus.HEALTHY);
+                    p.setInfectedAt(null);
+                }
+                playerRepository.save(p);
+            }
 
-        playerRepository.save(player);
+            // Calcular k y A basados en los jugadores reales conectados
+            double actualK = (double) totalPlayers;
+            double actualA = mathService.calculateInitialA(actualK, p0Count);
+            session.setCarryingCapacityK(actualK);
+            session.setIntegrationConstantA(actualA);
+            sessionRepository.save(session);
 
-        // Registrar inmediatamente en Redis para que compute dentro del límite poblacional 'k'
-        redisRepository.recordHeartbeat(id, playerUuid, 0);
+            // Notificar a cada jugador su rol asignado mediante unicast por WebSocket
+            for (PlayerNode p : players) {
+                StateChangeMessage stateChange = new StateChangeMessage(
+                    p.getPlayerUuid(),
+                    p.getStatus().name(),
+                    null,
+                    p.getStatus() == PlayerStatus.PATIENT_ZERO ? "TACHYCARDIA_FAST" : null,
+                    Instant.now().toString()
+                );
+                messagingTemplate.convertAndSendToUser(p.getPlayerUuid(), "/queue/state", stateChange);
+            }
 
-        return ResponseEntity.status(HttpStatus.CREATED).body(
-            new JoinResponse(
-                playerUuid,
-                id,
-                assignedStatus,
-                player.getCreatedAt()
+            // Emitir un BoardUpdate inmediato con sessionStatus = ACTIVE para que todos pasen al tablero
+            BoardUpdateMessage initialBoard = new BoardUpdateMessage(
+                session.getId(),
+                actualK,
+                actualA,
+                session.getGrowthRateR(),
+                p0Count,
+                totalPlayers - p0Count,
+                (double) p0Count,
+                Instant.now().toEpochMilli(),
+                SessionStatus.ACTIVE.name(),
+                totalPlayers,
+                MIN_PLAYERS_REQUIRED,
+                true
+            );
+            messagingTemplate.convertAndSend("/topic/board/" + session.getId(), initialBoard);
+        }
+
+        List<String> uuids = players.stream().map(PlayerNode::getPlayerUuid).toList();
+        return ResponseEntity.ok(
+            new SessionResponse(
+                session.getId(),
+                session.getSessionCode(),
+                session.getStatus(),
+                session.getInitialInfectedP0(),
+                session.getCarryingCapacityK(),
+                session.getIntegrationConstantA(),
+                totalPlayers,
+                MIN_PLAYERS_REQUIRED,
+                true,
+                uuids
             )
         );
     }
@@ -159,6 +288,10 @@ public class SessionController {
         GameSession session = sessionRepository.findById(id)
             .orElseThrow(() -> new ResourceNotFoundException("Sesión no encontrada con ID: " + id));
 
+        List<PlayerNode> players = playerRepository.findBySessionId(id);
+        long totalPlayers = players.size();
+        List<String> uuids = players.stream().map(PlayerNode::getPlayerUuid).toList();
+
         return ResponseEntity.ok(
             new SessionResponse(
                 session.getId(),
@@ -166,7 +299,11 @@ public class SessionController {
                 session.getStatus(),
                 session.getInitialInfectedP0(),
                 session.getCarryingCapacityK(),
-                session.getIntegrationConstantA()
+                session.getIntegrationConstantA(),
+                totalPlayers,
+                MIN_PLAYERS_REQUIRED,
+                totalPlayers >= MIN_PLAYERS_REQUIRED,
+                uuids
             )
         );
     }
@@ -176,6 +313,7 @@ public class SessionController {
         return ResponseEntity.ok(Map.of(
             "status", "UP",
             "service", "viral-simulation-backend",
+            "minPlayersRequired", String.valueOf(MIN_PLAYERS_REQUIRED),
             "timestamp", Instant.now().toString()
         ));
     }

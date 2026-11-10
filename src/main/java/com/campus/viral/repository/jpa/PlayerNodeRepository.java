@@ -20,6 +20,8 @@ public interface PlayerNodeRepository extends JpaRepository<PlayerNode, Long> {
 
     Optional<PlayerNode> findBySessionIdAndDeviceMacHash(Long sessionId, String deviceMacHash);
 
+    long countBySessionId(Long sessionId);
+
     long countBySessionIdAndStatusIn(Long sessionId, Collection<PlayerStatus> statuses);
 
     @Query("SELECT p.fcmToken FROM PlayerNode p WHERE p.session.id = :sessionId AND p.status = 'HEALTHY' AND p.fcmToken IS NOT NULL")
