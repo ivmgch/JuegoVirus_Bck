@@ -23,11 +23,9 @@ import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.security.SecureRandom;
 import java.time.Instant;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 
 @RestController
 @RequestMapping("/api/v1/sessions")
@@ -60,48 +58,45 @@ public class SessionController {
     @Transactional
     public ResponseEntity<SessionResponse> createSession(@Valid @RequestBody CreateSessionRequest request) {
         Optional<GameSession> existing = sessionRepository.findBySessionCode(request.sessionCode());
+        GameSession session;
         if (existing.isPresent()) {
-            GameSession s = existing.get();
-            List<PlayerNode> currentPlayers = playerRepository.findBySessionId(s.getId());
-            long total = currentPlayers.size();
-            List<String> uuids = currentPlayers.stream().map(PlayerNode::getPlayerUuid).toList();
-
-            return ResponseEntity.ok(
-                new SessionResponse(
-                    s.getId(),
-                    s.getSessionCode(),
-                    s.getStatus(),
-                    s.getInitialInfectedP0(),
-                    s.getCarryingCapacityK(),
-                    s.getIntegrationConstantA(),
-                    total,
-                    MIN_PLAYERS_REQUIRED,
-                    total >= MIN_PLAYERS_REQUIRED,
-                    uuids
-                )
+            session = existing.get();
+            // Limpiar jugadores anteriores/huérfanos de partidas previas para garantizar una sala 100% limpia
+            List<PlayerNode> oldPlayers = playerRepository.findBySessionId(session.getId());
+            if (!oldPlayers.isEmpty()) {
+                for (PlayerNode p : oldPlayers) {
+                    redisRepository.removePlayer(session.getId(), p.getPlayerUuid());
+                }
+                playerRepository.deleteAll(oldPlayers);
+            }
+            session.setStatus(SessionStatus.WAITING_FOR_PLAYERS);
+            session.setInitialInfectedP0(Math.max(1, request.initialP0()));
+            session.setCarryingCapacityK(0.0);
+            session.setIntegrationConstantA(1.0);
+            session.setStartedAt(null);
+            session.setInflectionAlertSent(false);
+            session = sessionRepository.save(session);
+        } else {
+            // Se inicia en sala de espera hasta que se conecten al menos 3 jugadores
+            session = new GameSession(
+                request.sessionCode(),
+                SessionStatus.WAITING_FOR_PLAYERS,
+                Math.max(1, request.initialP0()),
+                0.0,
+                1.0,
+                null
             );
+            session = sessionRepository.save(session);
         }
-
-        // Se inicia en sala de espera hasta que se conecten al menos 3 jugadores
-        GameSession session = new GameSession(
-            request.sessionCode(),
-            SessionStatus.WAITING_FOR_PLAYERS,
-            Math.max(1, request.initialP0()),
-            0.0,
-            1.0,
-            null
-        );
-
-        GameSession saved = sessionRepository.save(session);
 
         return ResponseEntity.status(HttpStatus.CREATED).body(
             new SessionResponse(
-                saved.getId(),
-                saved.getSessionCode(),
-                saved.getStatus(),
-                saved.getInitialInfectedP0(),
-                saved.getCarryingCapacityK(),
-                saved.getIntegrationConstantA(),
+                session.getId(),
+                session.getSessionCode(),
+                session.getStatus(),
+                session.getInitialInfectedP0(),
+                session.getCarryingCapacityK(),
+                session.getIntegrationConstantA(),
                 0,
                 MIN_PLAYERS_REQUIRED,
                 false,
@@ -213,12 +208,16 @@ public class SessionController {
             session.setStatus(SessionStatus.ACTIVE);
             session.setStartedAt(Instant.now());
 
-            // Asignar Paciente Cero entre los jugadores conectados
-            // Al menos 1 paciente cero y como máximo (totalPlayers - 1) para que haya sanos susceptibles
+            // SORTEO ALEATORIO SECRETO DEL VIRUS:
+            // Barajamos aleatoriamente la lista de participantes para que nadie sepa a quién le tocará
+            List<PlayerNode> shuffledPlayers = new ArrayList<>(players);
+            Collections.shuffle(shuffledPlayers, new SecureRandom());
+
+            // Asignar Paciente(s) Cero entre los jugadores sorteados al azar
             int p0Count = Math.max(1, Math.min(session.getInitialInfectedP0(), (int) totalPlayers - 1));
 
-            for (int i = 0; i < players.size(); i++) {
-                PlayerNode p = players.get(i);
+            for (int i = 0; i < shuffledPlayers.size(); i++) {
+                PlayerNode p = shuffledPlayers.get(i);
                 if (i < p0Count) {
                     p.setStatus(PlayerStatus.PATIENT_ZERO);
                     p.setInfectedAt(Instant.now());
@@ -236,8 +235,8 @@ public class SessionController {
             session.setIntegrationConstantA(actualA);
             sessionRepository.save(session);
 
-            // Notificar a cada jugador su rol asignado mediante unicast por WebSocket
-            for (PlayerNode p : players) {
+            // Notificar a cada jugador en SECRETO su rol asignado mediante unicast por WebSocket
+            for (PlayerNode p : shuffledPlayers) {
                 StateChangeMessage stateChange = new StateChangeMessage(
                     p.getPlayerUuid(),
                     p.getStatus().name(),
