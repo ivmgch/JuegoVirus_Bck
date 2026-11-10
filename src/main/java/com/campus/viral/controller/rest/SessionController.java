@@ -308,6 +308,120 @@ public class SessionController {
         );
     }
 
+    /**
+     * Finaliza la partida de simulación (Host).
+     */
+    @PostMapping("/{id}/finish")
+    @Transactional
+    public ResponseEntity<SessionResponse> finishSession(@PathVariable("id") Long id) {
+        GameSession session = sessionRepository.findById(id)
+            .orElseThrow(() -> new ResourceNotFoundException("Sesión no encontrada con ID: " + id));
+
+        session.setStatus(SessionStatus.COMPLETED);
+        sessionRepository.save(session);
+
+        List<PlayerNode> players = playerRepository.findBySessionId(id);
+        long totalPlayers = players.size();
+        long infectedCount = players.stream()
+            .filter(p -> p.getStatus() == PlayerStatus.PATIENT_ZERO || p.getStatus() == PlayerStatus.INFECTED)
+            .count();
+        long healthyCount = totalPlayers - infectedCount;
+
+        // Notificar a todos los dispositivos por WebSocket que la simulación terminó
+        BoardUpdateMessage finishedBoard = new BoardUpdateMessage(
+            session.getId(),
+            session.getCarryingCapacityK(),
+            session.getIntegrationConstantA(),
+            session.getGrowthRateR(),
+            infectedCount,
+            healthyCount,
+            (double) infectedCount,
+            Instant.now().toEpochMilli(),
+            SessionStatus.COMPLETED.name(),
+            totalPlayers,
+            MIN_PLAYERS_REQUIRED,
+            false
+        );
+        messagingTemplate.convertAndSend("/topic/board/" + session.getId(), finishedBoard);
+
+        List<String> uuids = players.stream().map(PlayerNode::getPlayerUuid).toList();
+        return ResponseEntity.ok(
+            new SessionResponse(
+                session.getId(),
+                session.getSessionCode(),
+                session.getStatus(),
+                session.getInitialInfectedP0(),
+                session.getCarryingCapacityK(),
+                session.getIntegrationConstantA(),
+                totalPlayers,
+                MIN_PLAYERS_REQUIRED,
+                false,
+                uuids
+            )
+        );
+    }
+
+    /**
+     * Permite a un jugador salir de la partida o de la sala de espera.
+     */
+    @PostMapping("/{id}/leave")
+    @Transactional
+    public ResponseEntity<Map<String, Object>> leaveSession(
+        @PathVariable("id") Long id,
+        @RequestParam("playerUuid") String playerUuid
+    ) {
+        GameSession session = sessionRepository.findById(id)
+            .orElseThrow(() -> new ResourceNotFoundException("Sesión no encontrada con ID: " + id));
+
+        Optional<PlayerNode> playerOpt = playerRepository.findBySessionId(id).stream()
+            .filter(p -> p.getPlayerUuid().equalsIgnoreCase(playerUuid))
+            .findFirst();
+
+        if (playerOpt.isPresent()) {
+            PlayerNode player = playerOpt.get();
+            playerRepository.delete(player);
+        }
+
+        // Remover del rastreo en Redis
+        redisRepository.removePlayer(id, playerUuid);
+
+        // Recalcular conteo de jugadores restantes
+        List<PlayerNode> remainingPlayers = playerRepository.findBySessionId(id);
+        long totalCount = remainingPlayers.size();
+        long infectedCount = remainingPlayers.stream()
+            .filter(p -> p.getStatus() == PlayerStatus.PATIENT_ZERO || p.getStatus() == PlayerStatus.INFECTED)
+            .count();
+        long healthyCount = totalCount - infectedCount;
+
+        if (session.getStatus() == SessionStatus.ACTIVE) {
+            session.setCarryingCapacityK((double) totalCount);
+            sessionRepository.save(session);
+        }
+
+        BoardUpdateMessage updateMessage = new BoardUpdateMessage(
+            id,
+            session.getStatus() == SessionStatus.ACTIVE ? session.getCarryingCapacityK() : (double) totalCount,
+            session.getIntegrationConstantA(),
+            session.getGrowthRateR(),
+            infectedCount,
+            healthyCount,
+            (double) infectedCount,
+            System.currentTimeMillis(),
+            session.getStatus().name(),
+            totalCount,
+            MIN_PLAYERS_REQUIRED,
+            totalCount >= MIN_PLAYERS_REQUIRED
+        );
+        messagingTemplate.convertAndSend("/topic/board/" + id, updateMessage);
+
+        return ResponseEntity.ok(Map.of(
+            "message", "Jugador salió de la partida exitosamente",
+            "sessionId", id,
+            "playerUuid", playerUuid,
+            "remainingPlayers", totalCount
+        ));
+    }
+
     @GetMapping("/health")
     public ResponseEntity<Map<String, String>> healthCheck() {
         return ResponseEntity.ok(Map.of(
