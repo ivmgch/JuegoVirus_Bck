@@ -67,14 +67,15 @@ public class GameWebSocketController {
                 Instant.now().toString()
             );
 
-            // Emisión UNICAST: Llega a la cola privada del cliente (/user/{playerUuid}/queue/state)
+            // Doble canal de entrega: Topic dedicado por nodo y cola de usuario Unicast
+            messagingTemplate.convertAndSend("/topic/player/" + payload.healthyPlayerUuid() + "/state", stateChange);
             messagingTemplate.convertAndSendToUser(
                 payload.healthyPlayerUuid(),
                 "/queue/state",
                 stateChange
             );
 
-            log.info("Notificación UNICAST de STATE_CHANGE despachada al nodo {}", payload.healthyPlayerUuid());
+            log.info("Notificación de STATE_CHANGE (INFECTED) despachada al nodo {}", payload.healthyPlayerUuid());
         }
     }
 }

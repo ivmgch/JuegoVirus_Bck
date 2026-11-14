@@ -18,6 +18,9 @@ public interface PlayerNodeRepository extends JpaRepository<PlayerNode, Long> {
 
     Optional<PlayerNode> findByPlayerUuid(String playerUuid);
 
+    @Query("SELECT p FROM PlayerNode p WHERE p.playerUuid = :uuidOrPrefix OR p.playerUuid LIKE CONCAT(:uuidOrPrefix, '%')")
+    List<PlayerNode> findByPlayerUuidOrPrefix(@Param("uuidOrPrefix") String uuidOrPrefix);
+
     Optional<PlayerNode> findBySessionIdAndDeviceMacHash(Long sessionId, String deviceMacHash);
 
     long countBySessionId(Long sessionId);
@@ -28,7 +31,7 @@ public interface PlayerNodeRepository extends JpaRepository<PlayerNode, Long> {
     List<String> findHealthyFcmTokensBySessionId(@Param("sessionId") Long sessionId);
 
     @Modifying
-    @Query("UPDATE PlayerNode p SET p.status = :newStatus, p.infectedAt = :now WHERE p.playerUuid = :uuid AND p.status = 'HEALTHY'")
+    @Query("UPDATE PlayerNode p SET p.status = :newStatus, p.infectedAt = :now WHERE LOWER(p.playerUuid) = LOWER(:uuid) AND p.status = 'HEALTHY'")
     int markInfectedIfHealthy(
         @Param("uuid") String uuid,
         @Param("newStatus") PlayerStatus newStatus,

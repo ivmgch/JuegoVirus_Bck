@@ -34,15 +34,22 @@ public class InfectionService {
      */
     @Transactional
     public boolean processExposureReport(ExposureReportPayload payload) {
-        // Regla RN04: Duración mínima continua >= 15s y distancia estimada <= 2.0m
-        if (payload.exposureDurationSeconds() < 15 || payload.estimatedDistanceMeters() > 2.0) {
+        // Descartar autorreporte
+        if (payload.healthyPlayerUuid() == null || payload.healthyPlayerUuid().equalsIgnoreCase(payload.infectedBeaconUuid())) {
+            return false;
+        }
+
+        // Regla RN04: Duración mínima continua >= 15s y distancia estimada <= 2.2m (con margen de tolerancia RF)
+        if (payload.exposureDurationSeconds() < 15 || payload.estimatedDistanceMeters() > 2.2) {
             log.debug("Reporte ignorado: no cumple umbrales de proximidad RN04 (duración={}, distancia={})",
                 payload.exposureDurationSeconds(), payload.estimatedDistanceMeters());
             return false;
         }
 
         // Validar existencia y estado del transmisor (debe ser INFECTED o PATIENT_ZERO)
-        Optional<PlayerNode> transmitterOpt = playerRepository.findByPlayerUuid(payload.infectedBeaconUuid());
+        // Soporta búsqueda por UUID completo o por prefijo emitido en balizas BLE
+        Optional<PlayerNode> transmitterOpt = playerRepository.findByPlayerUuidOrPrefix(payload.infectedBeaconUuid())
+            .stream().findFirst();
         if (transmitterOpt.isEmpty()) {
             log.warn("Transmisor no encontrado en el sistema: {}", payload.infectedBeaconUuid());
             return false;
@@ -65,13 +72,13 @@ public class InfectionService {
 
         if (updatedRows > 0) {
             log.info("CONTAGIO CONFIRMADO: Jugador {} infectado por beacon {}",
-                payload.healthyPlayerUuid(), payload.infectedBeaconUuid());
+                payload.healthyPlayerUuid(), transmitter.getPlayerUuid());
 
             // Registrar log de auditoría histórica
             InfectionAuditLog audit = new InfectionAuditLog(
                 transmitter.getSession(),
                 payload.healthyPlayerUuid(),
-                payload.infectedBeaconUuid(),
+                transmitter.getPlayerUuid(),
                 payload.exposureDurationSeconds(),
                 payload.estimatedDistanceMeters()
             );

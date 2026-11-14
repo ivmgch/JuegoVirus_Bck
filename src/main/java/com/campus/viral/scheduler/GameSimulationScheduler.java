@@ -113,18 +113,26 @@ public class GameSimulationScheduler {
             long bleInteractions = redisRepository.getRecentBleInteractionsCount(sessionId);
             double dynamicR = mathService.calculateDynamicR(currentK, bleInteractions);
 
-            // 4. Suavizar la constante 'A' para mantener la continuidad en la gráfica de Vico
-            double currentA = mathService.recalculateSmoothedA(
-                currentK,
-                (double) realInfectedCount,
-                dynamicR,
-                tElapsedSeconds
-            );
+            // 4. Gestión de la constante de integración 'A':
+            // En el modelo logístico P(t) = k / (A*e^(-rt) + 1), 'A' se evalúa en t=0 como (k - P0) / P0.
+            // Para mantener la consistencia teórica de la ecuación de Verhulst, 'A' se mantiene constante
+            // y solo se recalcula si la capacidad 'k' varía bruscamente (entrada o salida de participantes).
+            double previousK = session.getCarryingCapacityK();
+            double currentA = session.getIntegrationConstantA();
+            if (currentA <= 0.0) {
+                currentA = mathService.calculateInitialA(currentK, Math.max(1, session.getInitialInfectedP0()));
+            }
 
-            // 5. Resolver P(t) teórico
+            if (previousK > 0 && Math.abs(currentK - previousK) >= 1.0) {
+                // k varió bruscamente: recalcular A preservando el valor P(t) alcanzado para evitar saltos discretos
+                double currentPt = mathService.solveLogistic(previousK, currentA, dynamicR, tElapsedSeconds);
+                currentA = mathService.recalculateSmoothedA(currentK, currentPt, dynamicR, tElapsedSeconds);
+            }
+
+            // 5. Resolver P(t) teórico evaluando la solución analítica continua de la ecuación diferencial
             double theoreticalPt = mathService.solveLogistic(currentK, currentA, dynamicR, tElapsedSeconds);
 
-            // 6. Actualizar las constantes de la sesión en PostgreSQL
+            // 6. Actualizar las constantes de la sesión en base de datos
             session.setCarryingCapacityK(currentK);
             session.setIntegrationConstantA(currentA);
             session.setGrowthRateR(dynamicR);

@@ -235,7 +235,7 @@ public class SessionController {
             session.setIntegrationConstantA(actualA);
             sessionRepository.save(session);
 
-            // Notificar a cada jugador en SECRETO su rol asignado mediante unicast por WebSocket
+            // Notificar a cada jugador en SECRETO su rol asignado mediante unicast y topic privado por WebSocket
             for (PlayerNode p : shuffledPlayers) {
                 StateChangeMessage stateChange = new StateChangeMessage(
                     p.getPlayerUuid(),
@@ -244,6 +244,7 @@ public class SessionController {
                     p.getStatus() == PlayerStatus.PATIENT_ZERO ? "TACHYCARDIA_FAST" : null,
                     Instant.now().toString()
                 );
+                messagingTemplate.convertAndSend("/topic/player/" + p.getPlayerUuid() + "/state", stateChange);
                 messagingTemplate.convertAndSendToUser(p.getPlayerUuid(), "/queue/state", stateChange);
             }
 
@@ -418,6 +419,32 @@ public class SessionController {
             "sessionId", id,
             "playerUuid", playerUuid,
             "remainingPlayers", totalCount
+        ));
+    }
+
+    /**
+     * Consulta el estado actual de un jugador específico en la sesión (Fallback REST sincronizado).
+     */
+    @GetMapping("/{id}/players/{playerUuid}")
+    public ResponseEntity<Map<String, Object>> getPlayerStatus(
+        @PathVariable("id") Long id,
+        @PathVariable("playerUuid") String playerUuid
+    ) {
+        GameSession session = sessionRepository.findById(id)
+            .orElseThrow(() -> new ResourceNotFoundException("Sesión no encontrada con ID: " + id));
+
+        PlayerNode player = playerRepository.findByPlayerUuidOrPrefix(playerUuid)
+            .stream()
+            .filter(p -> p.getSession().getId().equals(id))
+            .findFirst()
+            .orElseThrow(() -> new ResourceNotFoundException("Jugador no encontrado en la sesión: " + playerUuid));
+
+        return ResponseEntity.ok(Map.of(
+            "playerUuid", player.getPlayerUuid(),
+            "sessionId", id,
+            "status", player.getStatus().name(),
+            "infectedAt", player.getInfectedAt() != null ? player.getInfectedAt().toString() : "",
+            "sessionStatus", session.getStatus().name()
         ));
     }
 
