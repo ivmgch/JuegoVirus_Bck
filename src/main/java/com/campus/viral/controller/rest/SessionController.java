@@ -5,6 +5,7 @@ import com.campus.viral.exception.ResourceNotFoundException;
 import com.campus.viral.model.domain.PlayerStatus;
 import com.campus.viral.model.domain.SessionStatus;
 import com.campus.viral.model.dto.request.CreateSessionRequest;
+import com.campus.viral.model.dto.request.ExposureReportPayload;
 import com.campus.viral.model.dto.request.JoinSessionRequest;
 import com.campus.viral.model.dto.response.BoardUpdateMessage;
 import com.campus.viral.model.dto.response.JoinResponse;
@@ -15,6 +16,7 @@ import com.campus.viral.model.entity.PlayerNode;
 import com.campus.viral.repository.jpa.GameSessionRepository;
 import com.campus.viral.repository.jpa.PlayerNodeRepository;
 import com.campus.viral.repository.redis.ActivePlayerRedisRepository;
+import com.campus.viral.service.InfectionService;
 import com.campus.viral.service.MathService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -38,17 +40,20 @@ public class SessionController {
     private final ActivePlayerRedisRepository redisRepository;
     private final MathService mathService;
     private final SimpMessagingTemplate messagingTemplate;
+    private final InfectionService infectionService;
 
     public SessionController(GameSessionRepository sessionRepository,
                              PlayerNodeRepository playerRepository,
                              ActivePlayerRedisRepository redisRepository,
                              MathService mathService,
-                             SimpMessagingTemplate messagingTemplate) {
+                             SimpMessagingTemplate messagingTemplate,
+                             InfectionService infectionService) {
         this.sessionRepository = sessionRepository;
         this.playerRepository = playerRepository;
         this.redisRepository = redisRepository;
         this.mathService = mathService;
         this.messagingTemplate = messagingTemplate;
+        this.infectionService = infectionService;
     }
 
     /**
@@ -445,6 +450,76 @@ public class SessionController {
             "status", player.getStatus().name(),
             "infectedAt", player.getInfectedAt() != null ? player.getInfectedAt().toString() : "",
             "sessionStatus", session.getStatus().name()
+        ));
+    }
+
+    /**
+     * Reporte de exposición BLE prolongada mediante REST (Fallback HTTP garantizado).
+     */
+    @PostMapping("/{id}/exposure")
+    @Transactional
+    public ResponseEntity<Map<String, Object>> reportExposure(
+        @PathVariable("id") Long id,
+        @RequestBody ExposureReportPayload payload
+    ) {
+        ExposureReportPayload finalPayload = payload.sessionId() == null ?
+            new ExposureReportPayload(id, payload.healthyPlayerUuid(), payload.infectedBeaconUuid(),
+                payload.exposureDurationSeconds(), payload.estimatedDistanceMeters()) : payload;
+
+        InfectionService.InfectionResult result = infectionService.processExposureReportDetailed(finalPayload);
+
+        if (result.infected()) {
+            StateChangeMessage stateChange = new StateChangeMessage(
+                result.newlyInfectedUuid(),
+                PlayerStatus.INFECTED.name(),
+                result.carrierUuid(),
+                "TACHYCARDIA_FAST",
+                Instant.now().toString()
+            );
+
+            messagingTemplate.convertAndSend("/topic/player/" + result.newlyInfectedUuid() + "/state", stateChange);
+            messagingTemplate.convertAndSendToUser(result.newlyInfectedUuid(), "/queue/state", stateChange);
+
+            if (result.sessionId() != null) {
+                String alertType = null;
+                String alertMessage = null;
+                String sessionStatus = SessionStatus.ACTIVE.name();
+
+                if (result.reached100Percent()) {
+                    alertType = "INFECTED_100_PERCENT";
+                    alertMessage = "¡BROTE TOTAL! El 100% de la población ha sido infectada. Fin de la simulación.";
+                    sessionStatus = SessionStatus.COMPLETED.name();
+                } else if (result.reached50Percent()) {
+                    alertType = "INFECTED_50_PERCENT";
+                    alertMessage = "⚠️ ¡ALERTA EPIDEMIOLÓGICA! Más del 50% de la población se encuentra infectada.";
+                }
+
+                BoardUpdateMessage boardUpdate = new BoardUpdateMessage(
+                    result.sessionId(),
+                    (double) result.totalPlayers(),
+                    1.0,
+                    0.05,
+                    result.totalInfected(),
+                    result.totalHealthy(),
+                    (double) result.totalInfected(),
+                    Instant.now().toEpochMilli(),
+                    sessionStatus,
+                    result.totalPlayers(),
+                    MIN_PLAYERS_REQUIRED,
+                    result.totalPlayers() >= MIN_PLAYERS_REQUIRED,
+                    alertType,
+                    alertMessage
+                );
+                messagingTemplate.convertAndSend("/topic/board/" + result.sessionId(), boardUpdate);
+            }
+        }
+
+        return ResponseEntity.ok(Map.of(
+            "processed", true,
+            "infected", result.infected(),
+            "newlyInfectedUuid", result.newlyInfectedUuid() != null ? result.newlyInfectedUuid() : "",
+            "reached50Percent", result.reached50Percent(),
+            "reached100Percent", result.reached100Percent()
         ));
     }
 

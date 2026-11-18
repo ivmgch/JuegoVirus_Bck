@@ -12,8 +12,42 @@ public record BoardUpdateMessage(
     String sessionStatus,
     long totalPlayers,
     int minPlayersRequired,
-    boolean canStart
+    boolean canStart,
+    String alertType,
+    String alertMessage
 ) {
+    public BoardUpdateMessage(
+        Long sessionId,
+        double k,
+        double a,
+        double r,
+        long totalInfected,
+        long totalHealthy,
+        double theoreticalInfectedPt,
+        long timestampMs,
+        String sessionStatus,
+        long totalPlayers,
+        int minPlayersRequired,
+        boolean canStart
+    ) {
+        this(
+            sessionId,
+            k,
+            a,
+            r,
+            totalInfected,
+            totalHealthy,
+            theoreticalInfectedPt,
+            timestampMs,
+            sessionStatus,
+            totalPlayers,
+            minPlayersRequired,
+            canStart,
+            null,
+            null
+        );
+    }
+
     public BoardUpdateMessage(
         Long sessionId,
         double k,
@@ -36,7 +70,9 @@ public record BoardUpdateMessage(
             "ACTIVE",
             totalInfected + totalHealthy,
             3,
-            (totalInfected + totalHealthy) >= 3
+            (totalInfected + totalHealthy) >= 3,
+            null,
+            null
         );
     }
 }

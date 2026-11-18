@@ -1,8 +1,10 @@
 package com.campus.viral.controller.ws;
 
 import com.campus.viral.model.domain.PlayerStatus;
+import com.campus.viral.model.domain.SessionStatus;
 import com.campus.viral.model.dto.request.ExposureReportPayload;
 import com.campus.viral.model.dto.request.HeartbeatPayload;
+import com.campus.viral.model.dto.response.BoardUpdateMessage;
 import com.campus.viral.model.dto.response.StateChangeMessage;
 import com.campus.viral.repository.redis.ActivePlayerRedisRepository;
 import com.campus.viral.service.InfectionService;
@@ -49,33 +51,71 @@ public class GameWebSocketController {
     }
 
     /**
-     * Recepción de reporte de exposición BLE prolongada (>15s a <2m).
+     * Recepción de reporte de exposición BLE prolongada (>10s a <2.8m).
      * Destino STOMP: /app/exposure/report
      */
     @MessageMapping("/exposure/report")
     public void handleExposureReport(@Payload ExposureReportPayload payload) {
-        log.info("Reporte de exposición recibido: {} expuesto a beacon {} por {}s",
+        log.info("Reporte de exposición recibido: nodo {} cerca de beacon {} por {}s",
             payload.healthyPlayerUuid(), payload.infectedBeaconUuid(), payload.exposureDurationSeconds());
 
-        boolean infected = infectionService.processExposureReport(payload);
+        InfectionService.InfectionResult result = infectionService.processExposureReportDetailed(payload);
 
-        if (infected) {
+        if (result.infected()) {
             StateChangeMessage stateChange = new StateChangeMessage(
-                payload.healthyPlayerUuid(),
+                result.newlyInfectedUuid(),
                 PlayerStatus.INFECTED.name(),
-                payload.infectedBeaconUuid(),
+                result.carrierUuid(),
+                "TACHYCARDIA_FAST",
                 Instant.now().toString()
             );
 
             // Doble canal de entrega: Topic dedicado por nodo y cola de usuario Unicast
-            messagingTemplate.convertAndSend("/topic/player/" + payload.healthyPlayerUuid() + "/state", stateChange);
+            messagingTemplate.convertAndSend("/topic/player/" + result.newlyInfectedUuid() + "/state", stateChange);
             messagingTemplate.convertAndSendToUser(
-                payload.healthyPlayerUuid(),
+                result.newlyInfectedUuid(),
                 "/queue/state",
                 stateChange
             );
 
-            log.info("Notificación de STATE_CHANGE (INFECTED) despachada al nodo {}", payload.healthyPlayerUuid());
+            log.info("Notificación de STATE_CHANGE (INFECTED) despachada al nodo {}", result.newlyInfectedUuid());
+
+            // Si hay sesión asociada, emitir actualización inmediata del tablero y alertas de 50%/100%
+            if (result.sessionId() != null) {
+                String alertType = null;
+                String alertMessage = null;
+                String sessionStatus = SessionStatus.ACTIVE.name();
+
+                if (result.reached100Percent()) {
+                    alertType = "INFECTED_100_PERCENT";
+                    alertMessage = "¡BROTE TOTAL! El 100% de la población ha sido infectada. Fin de la simulación.";
+                    sessionStatus = SessionStatus.COMPLETED.name();
+                } else if (result.reached50Percent()) {
+                    alertType = "INFECTED_50_PERCENT";
+                    alertMessage = "⚠️ ¡ALERTA EPIDEMIOLÓGICA! Más del 50% de la población se encuentra infectada.";
+                }
+
+                BoardUpdateMessage boardUpdate = new BoardUpdateMessage(
+                    result.sessionId(),
+                    (double) result.totalPlayers(),
+                    1.0,
+                    0.05,
+                    result.totalInfected(),
+                    result.totalHealthy(),
+                    (double) result.totalInfected(),
+                    Instant.now().toEpochMilli(),
+                    sessionStatus,
+                    result.totalPlayers(),
+                    3,
+                    result.totalPlayers() >= 3,
+                    alertType,
+                    alertMessage
+                );
+
+                messagingTemplate.convertAndSend("/topic/board/" + result.sessionId(), boardUpdate);
+                log.info("BoardUpdate inmediato emitido tras contagio en sesión {}: {} infectados / {} sanos (alerta: {})",
+                    result.sessionId(), result.totalInfected(), result.totalHealthy(), alertType);
+            }
         }
     }
 }

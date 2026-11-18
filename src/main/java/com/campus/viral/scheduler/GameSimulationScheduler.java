@@ -136,9 +136,35 @@ public class GameSimulationScheduler {
             session.setCarryingCapacityK(currentK);
             session.setIntegrationConstantA(currentA);
             session.setGrowthRateR(dynamicR);
+
+            // 7. Evaluar Alerta del 100% (Brote Total y Cierre Automático) y 50% (Punto Crítico)
+            String alertType = null;
+            String alertMessage = null;
+            String sessionStatus = SessionStatus.ACTIVE.name();
+
+            if (totalPlayers >= 3 && realInfectedCount >= totalPlayers) {
+                // BROTE TOTAL (100%): Concluir simulación automáticamente
+                session.setStatus(SessionStatus.COMPLETED);
+                sessionStatus = SessionStatus.COMPLETED.name();
+                alertType = "INFECTED_100_PERCENT";
+                alertMessage = "¡BROTE TOTAL! El 100% de la población ha sido infectada. Fin de la simulación.";
+                log.warn("¡BROTE TOTAL (100%) en scheduler para sesión {}! Simulación concluida automáticamente.", sessionId);
+            } else if (!session.isInflectionAlertSent() &&
+                       (realInfectedCount >= Math.ceil(totalPlayers * 0.5) || mathService.isInflectionPointReached((double) realInfectedCount, currentK))) {
+                // ALERTA EPIDEMIOLÓGICA (50% / Inflexión)
+                session.setInflectionAlertSent(true);
+                alertType = "INFECTED_50_PERCENT";
+                alertMessage = "⚠️ ¡ALERTA EPIDEMIOLÓGICA! Más del 50% de la población se encuentra infectada.";
+                log.warn("¡ALERTA CRÍTICA (50%)! Sesión {} alcanzó el 50% de infectados ({}/{})",
+                    sessionId, realInfectedCount, totalPlayers);
+
+                List<String> healthyTokens = playerRepository.findHealthyFcmTokensBySessionId(sessionId);
+                fcmNotificationService.sendCriticalInflectionAlert(healthyTokens, currentK, realInfectedCount);
+            }
+
             sessionRepository.save(session);
 
-            // 7. Emitir BROADCAST cada 5 segundos al tópico de la sesión (/topic/board/{sessionId})
+            // 8. Emitir BROADCAST cada 5 segundos al tópico de la sesión (/topic/board/{sessionId})
             BoardUpdateMessage boardUpdate = new BoardUpdateMessage(
                 sessionId,
                 currentK,
@@ -148,25 +174,15 @@ public class GameSimulationScheduler {
                 realHealthyCount,
                 theoreticalPt,
                 now.toEpochMilli(),
-                SessionStatus.ACTIVE.name(),
+                sessionStatus,
                 totalPlayers,
                 3,
-                true
+                true,
+                alertType,
+                alertMessage
             );
 
             messagingTemplate.convertAndSend("/topic/board/" + sessionId, boardUpdate);
-
-            // 8. Evaluar Alerta Crítica (Población infectada >= k / 2)
-            if (!session.isInflectionAlertSent() && mathService.isInflectionPointReached((double) realInfectedCount, currentK)) {
-                log.warn("¡ALERTA CRÍTICA! Sesión {} alcanzó el punto de inflexión k/2 (Infectados={}, k={})",
-                    sessionId, realInfectedCount, currentK);
-
-                List<String> healthyTokens = playerRepository.findHealthyFcmTokensBySessionId(sessionId);
-                fcmNotificationService.sendCriticalInflectionAlert(healthyTokens, currentK, realInfectedCount);
-
-                session.setInflectionAlertSent(true);
-                sessionRepository.save(session);
-            }
         }
     }
 }
